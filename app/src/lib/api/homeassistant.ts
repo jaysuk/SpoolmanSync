@@ -5,11 +5,13 @@
  * Entity discovery uses HA's WebSocket API to fetch the entity/device registries.
  * Bambu Lab printers are matched by translation_key (stable metadata set by ha-bambulab).
  * Creality printers are matched by entity_id patterns from ha_creality_ws.
+ * Duet (RepRapFirmware) printers are matched by unique_id patterns from duet3d.
  */
 
 import prisma from '@/lib/db';
 import WebSocket from 'ws';
 import { normalizeCrealityColorHex } from '@/lib/creality';
+import { DUET_PLATFORM, parseDuetExtruderUniqueId, isDuetUniqueId } from '@/lib/duet';
 
 export interface HAState {
   entity_id: string;
@@ -29,7 +31,7 @@ export interface HAAutomation {
   mode?: string;
 }
 
-export type PrinterBrand = 'bambu_lab' | 'creality' | 'virtual';
+export type PrinterBrand = 'bambu_lab' | 'creality' | 'duet' | 'virtual';
 
 export interface HAPrinter {
   brand: PrinterBrand;
@@ -43,6 +45,7 @@ export interface HAPrinter {
   print_weight_entity?: string;
   print_progress_entity?: string;
   used_material_entity?: string;  // Creality's used_material_length sensor (cm)
+  filament_extruded_entity?: string;  // Duet's job filament-extruded sensor (mm)
   is_virtual?: boolean;  // True for user-defined virtual printers (dry boxes/dryers)
 }
 
@@ -908,6 +911,9 @@ export class HomeAssistantClient {
     const crealityPrinters = this.discoverCrealityPrinters(entities, devices, stateMap);
     printers.push(...crealityPrinters);
 
+    // Discover Duet (RepRapFirmware) printers from the duet3d integration
+    printers.push(...this.discoverDuetPrinters(entities, devices, stateMap));
+
     // Single-spool / non-AMS printers (e.g. Ender 3 V3 KE with no CFS) expose no
     // assignable slot, so they can't be tracked. Synthesize one virtual external
     // spool slot for any discovered printer that has zero AMS units and zero
@@ -1089,6 +1095,79 @@ export class HomeAssistantClient {
   }
 
   /**
+   * Discover Duet (RepRapFirmware) printers from the duet3d integration.
+   *
+   * Matched by unique_id rather than entity_id: duet3d builds entity_ids from
+   * the user-chosen printer name, but its unique_ids embed a fixed sensor label
+   * ("Current State-<entry>", "extruder-<n>-<entry>", ...), which survives
+   * renames and translations.
+   *
+   * Every extruder becomes an external-spool "tray". RRF has no AMS; a tool
+   * changer or IDEX machine simply has several independent extruders, each of
+   * which can carry its own spool.
+   */
+  private discoverDuetPrinters(
+    entities: EntityRegistryEntry[],
+    devices: DeviceRegistryEntry[],
+    stateMap: Map<string, HAState>,
+  ): HAPrinter[] {
+    const duetEntities = entities.filter(e => e.platform === DUET_PLATFORM && !e.disabled_by);
+    if (duetEntities.length === 0) return [];
+
+    const byDevice = new Map<string, EntityRegistryEntry[]>();
+    for (const entity of duetEntities) {
+      if (!entity.device_id) continue;
+      if (!byDevice.has(entity.device_id)) byDevice.set(entity.device_id, []);
+      byDevice.get(entity.device_id)!.push(entity);
+    }
+
+    const printers: HAPrinter[] = [];
+    for (const [deviceId, deviceEntities] of byDevice) {
+      const stateEntity = deviceEntities.find(e => isDuetUniqueId(e.unique_id, 'Current State'));
+      if (!stateEntity) continue;
+
+      const extruderTrays: HATray[] = [];
+      for (const entity of deviceEntities) {
+        const extruder = parseDuetExtruderUniqueId(entity.unique_id);
+        if (extruder === null) continue;
+        const attrs = stateMap.get(entity.entity_id)?.attributes || {};
+        extruderTrays.push({
+          entity_id: entity.entity_id,
+          unique_id: entity.unique_id,
+          tray_number: extruder,
+          is_external: true,
+          name: (attrs.name as string) || undefined,
+          material: (attrs.type as string) || undefined,
+          // No tray_uuid: RRF has no per-spool identifier (see src/lib/duet.ts).
+        });
+      }
+      // No extruder entities means an older duet3d without spool support.
+      // Skipping the printer is safer than offering a printer with nothing to assign.
+      if (extruderTrays.length === 0) continue;
+      extruderTrays.sort((a, b) => a.tray_number - b.tray_number);
+
+      const device = devices.find(d => d.id === deviceId);
+      const prefix = stateEntity.entity_id
+        .replace(/^sensor\./, '')
+        .replace(/_current_state$/, '');
+      const extruded = deviceEntities.find(e => isDuetUniqueId(e.unique_id, 'Filament Extruded'));
+
+      printers.push({
+        brand: 'duet',
+        entity_id: stateEntity.entity_id,
+        name: device?.name_by_user || device?.name || prefix,
+        state: stateMap.get(stateEntity.entity_id)?.state || 'unknown',
+        prefix,
+        ams_units: [],
+        external_spools: extruderTrays,
+        filament_extruded_entity: extruded?.entity_id,
+      });
+    }
+
+    return printers;
+  }
+
+  /**
    * Get a mapping of entity_id → unique_id for all printer integration entities.
    * Used by the webhook handler to convert entity_ids to stable unique_ids.
    */
@@ -1105,7 +1184,7 @@ export class HomeAssistantClient {
    * its own WebSocket connection, and the webhook runs on every tray change.
    */
   async getTrayEntityRegistry(): Promise<Map<string, { uniqueId: string; platform: string }>> {
-    const supportedPlatforms = new Set(['bambu_lab', 'ha_creality_ws']);
+    const supportedPlatforms = new Set(['bambu_lab', 'ha_creality_ws', DUET_PLATFORM]);
     const { entities } = await this.getEntityAndDeviceRegistry();
     const map = new Map<string, { uniqueId: string; platform: string }>();
     for (const entity of entities) {

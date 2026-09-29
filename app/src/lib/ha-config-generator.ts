@@ -8,6 +8,7 @@
  */
 
 import { HAPrinter } from './api/homeassistant';
+import { DUET_PRINTING_STATES } from './duet';
 
 /**
  * A printer-level entity SpoolmanSync needs but could not find in HA.
@@ -47,7 +48,7 @@ interface TrayInfo {
  * Per-printer config collected during discovery
  */
 interface PrinterConfig {
-  brand: 'bambu_lab' | 'creality';
+  brand: 'bambu_lab' | 'creality' | 'duet';
   prefix: string;
   name: string;
   allTrays: TrayInfo[];
@@ -98,7 +99,31 @@ export function generateHAConfig(
       continue;
     }
 
-    if (printer.brand === 'creality') {
+    if (printer.brand === 'duet') {
+      // Duet / RepRapFirmware printer: every extruder is an external-spool tray
+      if (!printer.filament_extruded_entity) {
+        console.warn(`[SpoolmanSync] Could not find the Filament Extruded entity for Duet printer ${prefix}. Update the duet3d integration; usage tracking is disabled until it exists.`);
+        missingEntityReports.push({
+          prefix,
+          name: printer.name,
+          missing: ['filament_extruded'],
+          breaksUsageTracking: true,
+        });
+      }
+
+      const discoveredEntities: LocalizedEntities = {
+        current_stage: printer.entity_id,
+        print_weight: '',
+        print_progress: '',
+        filament_extruded: printer.filament_extruded_entity || '',
+        external_spools: printer.external_spools.map(es => es.entity_id),
+      };
+
+      const allTrays = collectTrays(printer);
+      totalTrayCount += allTrays.length;
+      printerConfigs.push({ brand: 'duet', prefix, name: printer.name, allTrays, discoveredEntities });
+      automationsYamlParts.push(generateDuetAutomationsYaml(prefix, allTrays, webhookUrl, discoveredEntities));
+    } else if (printer.brand === 'creality') {
       // Creality printer — different entity structure
       const missingEntities: string[] = [];
       if (!printer.used_material_entity) {
@@ -242,6 +267,7 @@ interface LocalizedEntities {
   print_weight: string;
   print_progress: string;
   used_material_length?: string;  // Creality only (cm)
+  filament_extruded?: string;  // Duet only (mm)
   external_spools: string[];
 }
 
@@ -981,13 +1007,282 @@ ${trayEntityIds.map(id => `        - ${id}`).join('\n')}
 }
 
 /**
+ * Generate automations.yaml content for a Duet (RepRapFirmware) printer.
+ *
+ * Structurally the Creality generator (extrusion is a running length, no
+ * per-spool serial), with these differences:
+ * - Every extruder is an external-spool "tray" (composite ids 0, 1, 2, ...), and
+ *   the active one is the extruder driven by the selected tool.
+ * - Print end is a return to `idle` from a filament-consuming state. `simulating`
+ *   is excluded so a simulation never bills a spool.
+ * - The extrusion counter is polled, and the final value arrives in the same
+ *   refresh that flips the status to idle. Print end therefore waits a few
+ *   seconds and re-reads the meter, so the last poll interval is not lost.
+ * - Unloading filament (an empty filament name) never clears an assignment.
+ *   RRF forgets filament names on every reboot, so treating empty as "spool
+ *   removed" would wipe every assignment each time the printer restarts.
+ *   Assignments are managed in SpoolmanSync instead.
+ */
+function generateDuetAutomationsYaml(
+  prefix: string,
+  allTrays: TrayInfo[],
+  webhookUrl: string,
+  entities: LocalizedEntities,
+): string {
+  const trayEntityIds = allTrays.map(t => t.entityId);
+  const trayEntityLookup = buildTrayEntityLookup(allTrays);
+  const printingStates = DUET_PRINTING_STATES.map(s => `        - ${s}`).join('\n');
+
+  // Same guard as the other generators: a blank entity_id makes Home Assistant
+  // reject the whole automation.
+  const printerStateTriggers = entities.current_stage
+    ? `
+    - entity_id: ${entities.current_stage}
+      from:
+${printingStates}
+      to: idle
+      id: print_end
+      trigger: state
+    - entity_id: ${entities.current_stage}
+      to:
+        - unavailable
+        - 'off'
+        - halted
+      # Sustained only: a brief network blip must not zero the usage meter (#75).
+      for: "00:02:00"
+      id: offline
+      trigger: state`
+    : `
+    # NOTE: no status entity was discovered for this printer, so the print-end
+    # and offline triggers are omitted. Usage is then only flushed on tool
+    # changes, never at print end.`;
+
+  // Re-read the meter after a short wait so the final extrusion poll is included.
+  const flushBody = (label: string, indent: string) => `${indent}- action: system_log.write
+${indent}  data:
+${indent}    message: >-
+${indent}      SPOOLMANSYNC ${label} (Duet) | Tray {{ tray_composite }} |
+${indent}      Sensor: {{ tray_sensor }} |
+${indent}      Spool: {{ name }} ({{ material }}) |
+${indent}      Length used: {{ tray_usage_cm }}cm
+${indent}    level: info
+${indent}- action: rest_command.spoolmansync_update_spool
+${indent}  data:
+${indent}    filament_name: "{{ name }}"
+${indent}    filament_material: "{{ material }}"
+${indent}    # RRF reports no per-spool serial; see src/lib/duet.ts.
+${indent}    filament_tray_uuid: ""
+${indent}    filament_used_length: "{{ tray_usage_cm }}"
+${indent}    filament_color: ""
+${indent}    filament_active_tray_id: "{{ tray_sensor }}"`;
+
+  const resetMeter = (indent: string) => `${indent}- action: utility_meter.calibrate
+${indent}  target:
+${indent}    entity_id: sensor.spoolmansync_${prefix}_filament_usage_meter
+${indent}  data:
+${indent}    value: "0"`;
+
+  return `# =============================================================================
+# SpoolmanSync Automation: Track Spool Usage (Duet / RepRapFirmware)
+#
+# Auto-generated by SpoolmanSync for Duet printer: ${prefix}
+# Tracks ${allTrays.length} extruder(s)
+#
+# Extruder encoding: composite_id = extruder index (0, 1, 2, ...)
+# =============================================================================
+- id: 'spoolmansync_update_spool_${prefix}'
+  alias: SpoolmanSync - Update Spool (${prefix})
+  description: Track spool usage and sync with Spoolman (Duet)
+  triggers:
+    - entity_id: sensor.spoolmansync_${prefix}_active_tray
+      id: tray
+      # Ignore availability flickers; '' is the sensor's normal "no tool" state
+      # and stays triggerable (the meter is preserved in the actions, #77).
+      not_from:
+        - unavailable
+        - unknown
+      not_to:
+        - unavailable
+        - unknown
+      trigger: state${printerStateTriggers}
+  variables:
+    old_tray: |-
+      {% if trigger.id == 'tray' and trigger.from_state is not none and trigger.from_state.state not in [None, '', 'unknown', 'unavailable'] %}
+        {{ trigger.from_state.state | int(-1) }}
+      {% else %}
+        -1
+      {% endif %}
+    new_tray: |-
+      {% if trigger.id == 'tray' and trigger.to_state is not none and trigger.to_state.state not in [None, '', 'unknown', 'unavailable'] %}
+        {{ trigger.to_state.state | int(-1) }}
+      {% else %}
+        -1
+      {% endif %}
+    # Last extruder this automation knew was in use: the flush target when the
+    # from-state names none.
+    helper_tray: "{{ states('input_number.spoolmansync_${prefix}_last_tray') | int(-1) }}"
+    tray_composite: |-
+      {% if trigger.id == 'print_end' %}
+        {{ helper_tray }}
+      {% else %}
+        {{ old_tray if old_tray >= 0 else helper_tray }}
+      {% endif %}
+    tray_sensor: "${trayEntityLookup}"
+    tray_usage_cm: "{{ states('sensor.spoolmansync_${prefix}_filament_usage_meter') | float(0) | round(2) }}"
+    material: "{{ state_attr(tray_sensor, 'type') | default('') }}"
+    name: "{{ state_attr(tray_sensor, 'name') | default('') }}"
+  actions:
+    - choose:
+        # =====================================================================
+        # TOOL CHANGE - flush usage to the outgoing (or last known) extruder,
+        # then remember the new one
+        # =====================================================================
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'tray' }}"
+          sequence:
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: >-
+                        {{ tray_composite >= 0 and tray_usage_cm >= 0.01 and tray_sensor != ''
+                           and (old_tray >= 0 or (new_tray >= 0 and new_tray != tray_composite)) }}
+                  sequence:
+${flushBody('TOOL CHANGE', '                    ')}
+${resetMeter('                    ')}
+                - conditions:
+                    - condition: template
+                      value_template: "{{ old_tray >= 0 }}"
+                  sequence:
+                    - action: system_log.write
+                      data:
+                        message: >-
+                          SPOOLMANSYNC TOOL CHANGE (Duet, no usage logged) | Old: {{ old_tray }} -> New: {{ new_tray }} |
+                          Length: {{ tray_usage_cm }}cm
+                        level: "{{ 'warning' if tray_usage_cm >= 0.01 else 'debug' }}"
+${resetMeter('                    ')}
+              default:
+                - action: system_log.write
+                  data:
+                    message: >-
+                      SPOOLMANSYNC TOOL CHANGE (Duet, meter preserved) | Old: {{ old_tray }} -> New: {{ new_tray }} |
+                      Length: {{ tray_usage_cm }}cm | Last tray: {{ helper_tray }}
+                    level: info
+            - condition: template
+              value_template: "{{ new_tray >= 0 }}"
+            - action: input_number.set_value
+              target:
+                entity_id: input_number.spoolmansync_${prefix}_last_tray
+              data:
+                value: "{{ new_tray }}"
+
+        # =====================================================================
+        # PRINT END - wait for the final extrusion poll, then flush the meter
+        # =====================================================================
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'print_end' }}"
+          sequence:
+            - delay: "00:00:05"
+            - variables:
+                tray_usage_cm: "{{ states('sensor.spoolmansync_${prefix}_filament_usage_meter') | float(0) | round(2) }}"
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ tray_composite >= 0 and tray_usage_cm >= 0.01 and tray_sensor != '' }}"
+                  sequence:
+${flushBody('PRINT END', '                    ')}
+              default:
+                - action: system_log.write
+                  data:
+                    message: >-
+                      SPOOLMANSYNC PRINT END (Duet, skipped) | Tray: {{ tray_composite }} | Length: {{ tray_usage_cm }}cm |
+                      Reason: {{ 'no tray in helper' if tray_composite < 0 else 'no length' }}
+                    level: "{{ 'warning' if tray_usage_cm >= 0.01 else 'info' }}"
+${resetMeter('            ')}
+
+        # =====================================================================
+        # PRINTER OFFLINE - bank the usage, THEN reset the meter (#78)
+        # =====================================================================
+        - conditions:
+            - condition: template
+              value_template: "{{ trigger.id == 'offline' }}"
+          sequence:
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ tray_composite >= 0 and tray_usage_cm >= 0.01 and tray_sensor != '' }}"
+                  sequence:
+${flushBody('OFFLINE FLUSH', '                    ')}
+              default:
+                - action: system_log.write
+                  data:
+                    message: >-
+                      SPOOLMANSYNC OFFLINE FLUSH (Duet, skipped) | Tray: {{ tray_composite }} | Length: {{ tray_usage_cm }}cm
+                    level: "{{ 'warning' if tray_usage_cm >= 0.01 else 'info' }}"
+${resetMeter('            ')}
+  # Queued, not single: print end waits for the final poll, and a tool change
+  # arriving in that window must not be dropped.
+  mode: queued
+  max: 10
+
+# =============================================================================
+# SpoolmanSync Automation: Filament Change Detection (Duet)
+#
+# Reports when a filament is loaded into an extruder (M701) so the dashboard can
+# show what the printer believes is loaded. Never unassigns: see the function
+# comment for why an empty filament name is ignored.
+# =============================================================================
+- id: 'spoolmansync_tray_change_${prefix}'
+  alias: SpoolmanSync - Tray Change (${prefix})
+  description: Report loaded filament per extruder (Duet)
+  triggers:
+    - entity_id:
+${trayEntityIds.map(id => `        - ${id}`).join('\n')}
+      trigger: state
+  conditions:
+    - condition: template
+      value_template: "{{ trigger.to_state is not none and trigger.to_state.state not in ['unavailable', 'unknown'] }}"
+    # Only a newly loaded filament: the name changed and is not empty.
+    - condition: template
+      value_template: >-
+        {{ trigger.to_state.attributes.get('name', '') != ''
+           and (trigger.from_state is none
+                or trigger.to_state.attributes.get('name', '') != trigger.from_state.attributes.get('name', '')) }}
+  variables:
+    tray_entity_id: "{{ trigger.entity_id }}"
+    name: "{{ state_attr(trigger.entity_id, 'name') | default('') }}"
+    material: "{{ state_attr(trigger.entity_id, 'type') | default('') }}"
+  actions:
+    - action: system_log.write
+      data:
+        message: >-
+          SPOOLMANSYNC FILAMENT LOADED (Duet) | {{ tray_entity_id }} |
+          Name: {{ name }} | Material: {{ material }}
+        level: info
+    - action: rest_command.spoolmansync_tray_change
+      data:
+        tray_entity_id: "{{ tray_entity_id }}"
+        tray_uuid: ""
+        name: "{{ name }}"
+        material: "{{ material }}"
+        color: ""
+        current_print_state: ${entities.current_stage
+          ? `"{{ states('${entities.current_stage}') }}"`
+          : `"unknown"  # no status entity discovered`}
+  mode: queued
+  max: 10
+`;
+}
+
+/**
  * Build Jinja2 template to detect active tray from all AMS/CFS units
  * Returns composite ID: 0 = external, 11-14 = AMS1/CFS1, 21-24 = AMS2/CFS2, etc.
  *
  * For Bambu: uses 'active' attribute (requires ha-bambulab 2.0.29+)
  * For Creality: uses 'selected' attribute (0/1)
  */
-function buildActiveTrayDetection(allTrays: TrayInfo[], brand: 'bambu_lab' | 'creality' = 'bambu_lab'): string {
+function buildActiveTrayDetection(allTrays: TrayInfo[], brand: 'bambu_lab' | 'creality' | 'duet' = 'bambu_lab'): string {
   const checks: string[] = [];
 
   const externalTrays = allTrays.filter(t => t.amsNumber === 0);
@@ -1121,7 +1416,25 @@ function generateConfigurationAdditions(
     // is ever sent, with no signal anywhere that this is what happened. We now
     // emit an explicitly-unavailable sensor that names the missing entity.
     let filamentUsageSensor: string;
-    if (p.brand === 'creality') {
+    if (p.brand === 'duet') {
+      // Duet: the extruded length of the current job in mm, exposed to the
+      // meter in cm to match the webhook's used_length unit.
+      //
+      // Simulations run the whole extrusion profile without moving filament, so
+      // the sensor is unavailable for their duration: the meter then skips them
+      // instead of billing a spool for filament that was never used.
+      filamentUsageSensor = p.discoveredEntities.filament_extruded
+        ? `      # ${p.prefix}: Track filament usage during print (Duet - mm converted to cm)
+      - name: "SpoolmanSync ${p.prefix} Filament Usage"
+        unique_id: spoolmansync-${p.prefix}-filament-usage
+        unit_of_measurement: "cm"
+        state: >
+          {{ states('${p.discoveredEntities.filament_extruded}') | float(0) / 10 }}
+        availability: >
+          {{ states('${p.discoveredEntities.filament_extruded}') not in ['unknown', 'unavailable']
+             and states('${p.discoveredEntities.current_stage}') not in ['simulating', 'unknown', 'unavailable'] }}`
+        : unavailableUsageSensor(p.prefix, ['filament_extruded']);
+    } else if (p.brand === 'creality') {
       // Creality: used_material_length is a running total in cm
       filamentUsageSensor = p.discoveredEntities.used_material_length
         ? `      # ${p.prefix}: Track filament usage during print (Creality - cm)
@@ -1157,7 +1470,7 @@ function generateConfigurationAdditions(
         : unavailableUsageSensor(p.prefix, missingForUsage);
     }
 
-    const unitLabel = p.brand === 'creality' ? 'CFS slot' : 'AMS tray';
+    const unitLabel = p.brand === 'creality' ? 'CFS slot' : p.brand === 'duet' ? 'extruder' : 'AMS tray';
 
     return `${filamentUsageSensor}
 

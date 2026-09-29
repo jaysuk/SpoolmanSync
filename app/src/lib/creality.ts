@@ -1,3 +1,5 @@
+import { DUET_PLATFORM } from '@/lib/duet';
+
 /**
  * Creality (ha_creality_ws / CFS) protocol quirks.
  *
@@ -7,7 +9,8 @@
  */
 
 /**
- * Home Assistant integrations whose trays carry no per-spool identifier, so a
+ * Home Assistant integrations whose trays carry no per-spool identifier (Duet/RRF
+ * has none either, see src/lib/duet.ts), so a
  * `tray_uuid` arriving from one must never be treated as a spool serial.
  *
  * ha_creality_ws surfaces the CFS slot's `rfid` attribute, which is Creality's
@@ -20,7 +23,7 @@
  * is a backstop for installs still running automations generated before that
  * change — an upgrade should not need a YAML re-apply to stop mis-assigning.
  */
-export const PLATFORMS_WITHOUT_SPOOL_SERIALS: ReadonlySet<string> = new Set(['ha_creality_ws']);
+export const PLATFORMS_WITHOUT_SPOOL_SERIALS: ReadonlySet<string> = new Set(['ha_creality_ws', DUET_PLATFORM]);
 
 /**
  * Whether a tray on `platform` may have its reported tray_uuid treated as a

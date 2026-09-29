@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { HomeAssistantClient } from '@/lib/api/homeassistant';
 import prisma from '@/lib/db';
 
-const SUPPORTED_DOMAINS = ['bambu_lab', 'ha_creality_ws'] as const;
+const SUPPORTED_DOMAINS = ['bambu_lab', 'ha_creality_ws', 'duet3d'] as const;
 type PrinterDomain = typeof SUPPORTED_DOMAINS[number];
 const HIDDEN_PRINTERS_KEY = 'hidden_printers';
 
@@ -35,7 +35,7 @@ async function saveHiddenPrinters(hidden: { entryId: string; title: string }[]):
 
 /**
  * GET /api/printers/setup
- * Get config entries for all supported printer integrations (Bambu Lab, Creality),
+ * Get config entries for all supported printer integrations (Bambu Lab, Creality, Duet),
  * filtered to exclude printers the user has removed from SpoolmanSync.
  * Also returns hidden entries so the UI can offer to re-add them.
  */
@@ -87,7 +87,7 @@ export async function GET() {
  * POST /api/printers/setup
  * Start or continue a printer config flow, or unhide a printer.
  *
- * Body for starting flow: { action: 'start', domain?: 'bambu_lab' | 'ha_creality_ws' }
+ * Body for starting flow: { action: 'start', domain?: 'bambu_lab' | 'ha_creality_ws' | 'duet3d' }
  * Body for continuing flow: { action: 'continue', flowId: string, userInput: object }
  * Body for aborting flow: { action: 'abort', flowId: string }
  * Body for re-adding hidden printer: { action: 'unhide', entryId: string }
@@ -112,7 +112,9 @@ export async function POST(request: NextRequest) {
           const msg = err instanceof Error ? err.message : '';
           // HA returns 404 "Invalid handler" when integration is not installed
           if (msg.includes('404') || msg.includes('Invalid handler')) {
-            const integrationName = targetDomain === 'ha_creality_ws' ? 'ha_creality_ws' : 'ha-bambulab';
+            const integrationName =
+              targetDomain === 'ha_creality_ws' ? 'ha_creality_ws' :
+              targetDomain === 'duet3d' ? 'duet3d (hass-Duet3D)' : 'ha-bambulab';
             return NextResponse.json({
               error: `The ${integrationName} integration is not installed in Home Assistant. Please install it via HACS first, then try again.`,
             }, { status: 400 });

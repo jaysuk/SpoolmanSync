@@ -1,6 +1,6 @@
 # SpoolmanSync
 
-**Automatic filament tracking for Bambu Lab and Creality printers with Spoolman**
+**Automatic filament tracking for Bambu Lab, Creality and Duet printers with Spoolman**
 
 ![Build Status](https://github.com/gibz104/SpoolmanSync/actions/workflows/docker-publish.yml/badge.svg)
 [![Ko-Fi](https://img.shields.io/badge/Ko--fi-Support%20this%20project-ff5f5f?logo=ko-fi)](https://ko-fi.com/gibz104)
@@ -34,7 +34,7 @@ Pick the option that matches your setup:
 3. Install **SpoolmanSync**, start it, and enable **Show in sidebar**
 4. Open from the sidebar and configure Spoolman URL in Settings
 
-Requires the [ha-bambulab](https://github.com/greghesp/ha-bambulab) integration (for Bambu Lab) or [ha_creality_ws](https://github.com/3dg1luk43/ha_creality_ws) (for Creality), both installable via [HACS](https://hacs.xyz/), plus [Spoolman](https://github.com/Donkie/Spoolman) running on your network.
+Requires the [ha-bambulab](https://github.com/greghesp/ha-bambulab) integration (for Bambu Lab) or [ha_creality_ws](https://github.com/3dg1luk43/ha_creality_ws) (for Creality) or [hass-Duet3D](https://github.com/Lyr3x/hass-Duet3D) (for Duet / RepRapFirmware, needs a version with extruder sensors), all installable via [HACS](https://hacs.xyz/), plus [Spoolman](https://github.com/Donkie/Spoolman) running on your network.
 
 ### Option 2: Embedded Mode (bundled Home Assistant)
 
@@ -88,6 +88,12 @@ Get notified via Home Assistant when you're down to your last spool of a filamen
 Alerts fire only when you're on your *last* spool of a group — no noise from partially-used spools when you have backups.
 
 ## Troubleshooting
+
+**Duet / RepRapFirmware** — each extruder is a slot you assign a spool to. Works with Duet 2 and Duet 3 boards in standalone or SBC mode, single extruder, tool changer or IDEX.
+- Usage is the filament extruded by the job, billed to the extruder of the selected tool, and converted from length to weight like Creality. The count comes from RRF's `job.rawExtrusion`, which is polled: extrusion since the last poll is lost if a job ends, so use a short update interval (5-10 s) in the duet3d integration for accurate totals.
+- Simulations are never billed.
+- RRF has no per-spool identifier, so spools are matched by assignment only, and unloading filament (`M702`) does not unassign a spool. RRF forgets filament names on every restart, so an empty name is ignored rather than treated as "spool removed".
+- The material comes from the filament name set by `M701 S"PLA"`, which is used for the "possible wrong spool" warning.
 
 **No printers showing up** — verify ha-bambulab or ha_creality_ws is installed in HA and your printers appear in the HA entity registry. Check the Logs page in SpoolmanSync.
 

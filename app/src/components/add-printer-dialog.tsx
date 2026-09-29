@@ -39,7 +39,7 @@ interface ConfigFlowResult {
   reason?: string; // Abort reason when type is 'abort'
 }
 
-type PrinterBrand = 'bambu_lab' | 'creality';
+type PrinterBrand = 'bambu_lab' | 'creality' | 'duet';
 
 interface AddPrinterDialogProps {
   open: boolean;
@@ -121,8 +121,8 @@ export function AddPrinterDialog({ open, onOpenChange, onSuccess }: AddPrinterDi
 
   const handleBrandSelect = (brand: PrinterBrand) => {
     setSelectedBrand(brand);
-    if (brand === 'creality') {
-      // Creality is local-only (mDNS/IP), skip cloud/LAN choice
+    if (brand === 'creality' || brand === 'duet') {
+      // Creality and Duet are local-only (IP/hostname), skip cloud/LAN choice
       startFlow(null, brand);
     } else {
       setStep('select');
@@ -131,7 +131,9 @@ export function AddPrinterDialog({ open, onOpenChange, onSuccess }: AddPrinterDi
 
   const startFlow = async (mode: ConnectionMode, brand?: PrinterBrand) => {
     const targetBrand = brand || selectedBrand || 'bambu_lab';
-    const domain = targetBrand === 'creality' ? 'ha_creality_ws' : 'bambu_lab';
+    const domain =
+      targetBrand === 'creality' ? 'ha_creality_ws' :
+      targetBrand === 'duet' ? 'duet3d' : 'bambu_lab';
     setConnectionMode(mode);
     setLoading(true);
 
@@ -701,6 +703,17 @@ export function AddPrinterDialog({ open, onOpenChange, onSuccess }: AddPrinterDi
                   K1, K2, Ender 3 V3 and other Creality printers
                 </span>
               </Button>
+              <Button
+                variant="outline"
+                className="w-full h-auto py-4 flex flex-col items-start gap-1"
+                onClick={() => handleBrandSelect('duet')}
+                disabled={loading}
+              >
+                <span className="font-medium">Duet (RepRapFirmware)</span>
+                <span className="text-xs text-muted-foreground font-normal">
+                  Duet 2 / Duet 3 boards, standalone or with a Raspberry Pi
+                </span>
+              </Button>
             </div>
           ) : step === 'select' ? (
             <div className="space-y-3 px-4">
@@ -852,6 +865,9 @@ function getPlaceholder(fieldName: string): string {
 }
 
 function getStepTitle(stepId?: string, brand?: PrinterBrand | null): string {
+  if (brand === 'duet') {
+    return 'Duet Printer Setup';
+  }
   if (brand === 'creality') {
     const titles: Record<string, string> = {
       user: 'Creality Printer Setup',
@@ -869,6 +885,9 @@ function getStepTitle(stepId?: string, brand?: PrinterBrand | null): string {
 }
 
 function getStepDescription(stepId?: string, mode?: ConnectionMode, brand?: PrinterBrand | null): string {
+  if (brand === 'duet') {
+    return "Enter your board's IP address or hostname. Make sure the duet3d integration (with spool support) is installed in Home Assistant.";
+  }
   if (brand === 'creality') {
     return 'Enter your printer\'s IP address or hostname. Make sure ha_creality_ws is installed in Home Assistant.';
   }

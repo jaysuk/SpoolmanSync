@@ -105,7 +105,9 @@ export function detectTrayMismatch(
   // src/lib/creality.ts), so gating on one would disable the check entirely.
   // The values are what the printer believes is loaded whether they came from a
   // tag or were entered on the printer, which is exactly what's worth comparing.
-  if (options.brand !== 'creality' && !isValidTrayUuid(tray.tray_uuid)) {
+  // Duet: always, for the same reason. RRF has no serial, and the filament name
+  // set by M701 is what the printer believes is loaded.
+  if (options.brand !== 'creality' && options.brand !== 'duet' && !isValidTrayUuid(tray.tray_uuid)) {
     return null;
   }
 
